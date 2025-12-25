@@ -25,6 +25,10 @@ class AudioProcessor:
     GEMINI_OUTPUT_SAMPLE_RATE = 24000  # For outgoing audio from Gemini
     GEMINI_CHANNELS = 1  # Mono
     GEMINI_FORMAT = 's16'  # 16-bit signed PCM
+
+    FRAME_DURATION_MS = 20
+    GEMINI_OUTPUT_FRAME_SAMPLES = int(GEMINI_OUTPUT_SAMPLE_RATE * FRAME_DURATION_MS / 1000)
+    WEBRTC_FRAME_SAMPLES = int(WEBRTC_SAMPLE_RATE * FRAME_DURATION_MS / 1000)
     
     def __init__(self):
         # Create resampler for incoming audio (48kHz -> 16kHz for Gemini input)
@@ -41,23 +45,64 @@ class AudioProcessor:
             layout='mono',
             rate=self.WEBRTC_SAMPLE_RATE
         )
-        
-        # Set resampling quality to best (if supported by PyAV version)
-        # This uses libswresample's highest quality algorithm
-        try:
-            # Try to set resampling algorithm to best quality
-            # PyAV may expose this through the resampler options
-            if hasattr(self.outgoing_resampler, 'set_option'):
-                # Use best quality resampling algorithm
-                self.outgoing_resampler.set_option('resampler', 'soxr')
-                self.outgoing_resampler.set_option('precision', '28')
-            elif hasattr(av, 'AudioResampler') and hasattr(av.AudioResampler, 'set_option'):
-                # Alternative method if available
-                pass
-        except Exception as e:
-            logger.warning(f"Could not set resampler quality options: {e}. Using default quality.")
+
+        self._configure_resampler(self.incoming_resampler, direction="incoming")
+        self._configure_resampler(self.outgoing_resampler, direction="outgoing")
+
+        self._outgoing_buffer = np.zeros(0, dtype=np.int16)
+        self._smoothed_gain = 1.0
         
         logger.info("Audio processor initialized with resamplers (48kHz->16kHz input, 24kHz->48kHz output)")
+
+    def _configure_resampler(self, resampler: av.AudioResampler, direction: str) -> None:
+        """Configure resampler for higher quality if supported by PyAV/libswresample."""
+        try:
+            if hasattr(resampler, 'set_option'):
+                # Prefer soxr for higher quality if available.
+                resampler.set_option('resampler', 'soxr')
+                resampler.set_option('precision', '28')
+                resampler.set_option('filter_size', '64')
+                resampler.set_option('phase_shift', '10')
+            else:
+                logger.debug(f"Resampler options not supported for {direction} audio.")
+        except Exception as e:
+            logger.warning(
+                f"Could not set resampler quality options for {direction} audio: {e}. Using default quality."
+            )
+
+    def _to_mono(self, audio_data: np.ndarray) -> np.ndarray:
+        """Ensure mono audio without introducing integer overflow."""
+        if len(audio_data.shape) == 1:
+            return audio_data
+        if audio_data.shape[0] == 1:
+            return audio_data[0]
+        return np.mean(audio_data.astype(np.float32), axis=0).astype(audio_data.dtype)
+
+    def _apply_limiter(self, pcm_audio: np.ndarray) -> np.ndarray:
+        """Apply a gentle limiter with smoothing to avoid pumping and clipping."""
+        if pcm_audio.size == 0:
+            return pcm_audio
+
+        peak = float(np.max(np.abs(pcm_audio)))
+        if peak == 0:
+            return pcm_audio
+
+        target_peak = 0.95 * 32767.0
+        desired_gain = min(1.0, target_peak / peak)
+
+        # Fast attack, slow release to avoid pumping
+        attack = 0.4
+        release = 0.08
+        if desired_gain < self._smoothed_gain:
+            self._smoothed_gain = (1 - attack) * self._smoothed_gain + attack * desired_gain
+        else:
+            self._smoothed_gain = (1 - release) * self._smoothed_gain + release * desired_gain
+
+        if self._smoothed_gain >= 0.999:
+            return pcm_audio
+
+        limited = pcm_audio.astype(np.float32) * self._smoothed_gain
+        return np.clip(limited, -32768, 32767).astype(np.int16)
     
     async def process_incoming_audio(self, frame: av.AudioFrame) -> Optional[np.ndarray]:
         """
@@ -84,8 +129,7 @@ class AudioProcessor:
                 audio_data = resampled_frames.to_ndarray()
             
             # Ensure mono (single channel)
-            if len(audio_data.shape) > 1:
-                audio_data = audio_data[0] if audio_data.shape[0] == 1 else np.mean(audio_data, axis=0)
+            audio_data = self._to_mono(audio_data)
             
             # Convert to int16 if needed
             if audio_data.dtype != np.int16:
@@ -117,22 +161,26 @@ class AudioProcessor:
                 pcm_audio = pcm_audio.astype(np.int16)
             
             # Ensure 1D array (mono)
-            if len(pcm_audio.shape) > 1:
-                pcm_audio = pcm_audio[0] if pcm_audio.shape[0] == 1 else np.mean(pcm_audio, axis=0)
-            
-            # Audio normalization: prevent clipping and ensure consistent volume
-            # More conservative normalization to avoid artifacts
-            max_val = np.max(np.abs(pcm_audio))
-            if max_val > 0:
-                # Only normalize if audio is close to clipping
-                if max_val > 30000:  # If close to clipping (int16 max is 32767)
-                    # Normalize to 95% to prevent clipping
-                    pcm_audio = (pcm_audio / max_val * 0.95 * 32767).astype(np.int16)
-                # Remove the aggressive boost for quiet audio - let Opus handle it
-                # This prevents artifacts from over-amplification
+            pcm_audio = self._to_mono(pcm_audio)
+
+            # Buffer and frame the audio to stable 20ms chunks (prevents jitter/stutter)
+            if self._outgoing_buffer.size == 0:
+                self._outgoing_buffer = pcm_audio
+            else:
+                self._outgoing_buffer = np.concatenate([self._outgoing_buffer, pcm_audio])
+
+            if self._outgoing_buffer.size >= self.GEMINI_OUTPUT_FRAME_SAMPLES:
+                frame_audio = self._outgoing_buffer[:self.GEMINI_OUTPUT_FRAME_SAMPLES]
+                self._outgoing_buffer = self._outgoing_buffer[self.GEMINI_OUTPUT_FRAME_SAMPLES:]
+            else:
+                pad_length = self.GEMINI_OUTPUT_FRAME_SAMPLES - self._outgoing_buffer.size
+                frame_audio = np.pad(self._outgoing_buffer, (0, pad_length), mode='constant')
+                self._outgoing_buffer = np.zeros(0, dtype=np.int16)
+
+            frame_audio = self._apply_limiter(frame_audio)
             
             # Reshape to 2D: (channels=1, samples) for PyAV
-            pcm_audio_2d = pcm_audio.reshape(1, -1) if len(pcm_audio.shape) == 1 else pcm_audio
+            pcm_audio_2d = frame_audio.reshape(1, -1)
             
             # Create AudioFrame from numpy array (24kHz from Gemini)
             # CRITICAL: Explicitly set input sample rate to 24kHz before resampling
@@ -157,7 +205,7 @@ class AudioProcessor:
             if isinstance(resampled_frames, list):
                 if len(resampled_frames) == 0:
                     # Return silence frame
-                    silence_array = np.zeros((1, 480), dtype=np.int16)
+                    silence_array = np.zeros((1, self.WEBRTC_FRAME_SAMPLES), dtype=np.int16)
                     silence_frame = av.AudioFrame.from_ndarray(
                         silence_array,
                         format=self.WEBRTC_FORMAT,
@@ -203,7 +251,7 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"Error processing outgoing audio: {e}", exc_info=True)
             # Return silence frame on error
-            silence_array = np.zeros((1, 480), dtype=np.int16)
+            silence_array = np.zeros((1, self.WEBRTC_FRAME_SAMPLES), dtype=np.int16)
             return av.AudioFrame.from_ndarray(
                 silence_array,  # Shape: (channels, samples) as 2D numpy array
                 format=self.WEBRTC_FORMAT,
@@ -214,4 +262,3 @@ class AudioProcessor:
         """Cleanup resources"""
         # Resamplers don't need explicit cleanup in av
         logger.debug("Audio processor cleaned up")
-
