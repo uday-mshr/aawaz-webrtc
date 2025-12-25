@@ -743,7 +743,7 @@ class AudioTrack(MediaStreamTrack):
         super().__init__()
         self.audio_queue = audio_queue
         self.audio_processor = AudioProcessor()
-        self.pts = 0  # Presentation timestamp for audio synchronization
+        self.next_pts = None  # Presentation timestamp for audio synchronization (initialized to None)
         self.sample_rate = 48000  # WebRTC expects 48kHz
     
     async def recv(self):
@@ -757,6 +757,10 @@ class AudioTrack(MediaStreamTrack):
                 logger.debug(f"[PATH: AudioTrack.recv] Received audio from queue: {len(pcm_audio)} samples, dtype={pcm_audio.dtype}")
             except asyncio.TimeoutError:
                 # Return silence frame if no audio available (normal during gaps)
+                # Initialize next_pts if not set
+                if self.next_pts is None:
+                    self.next_pts = 0
+                
                 # Create numpy array for silence (48kHz, 10ms = 480 samples)
                 # Reshape to 2D: (channels=1, samples=480)
                 silence_array = np.zeros((1, 480), dtype=np.int16)
@@ -767,24 +771,34 @@ class AudioTrack(MediaStreamTrack):
                     layout='mono'
                 )
                 frame.sample_rate = self.sample_rate
-                frame.pts = self.pts
-                self.pts += frame.samples  # Increment PTS for next frame
+                frame.pts = self.next_pts
+                # Update next_pts to keep timeline continuous (480 samples = 10ms at 48kHz)
+                self.next_pts += 480
                 return frame
             
             # Resample to Opus/48kHz for WebRTC
             frame = await self.audio_processor.process_outgoing_audio(pcm_audio)
             logger.debug(f"[PATH: AudioTrack.recv] Processed audio frame, returning to WebRTC")
             
+            # Initialize next_pts if not set
+            if self.next_pts is None:
+                self.next_pts = 0
+            
             # Ensure sample rate and PTS are set for proper audio synchronization
             frame.sample_rate = self.sample_rate
-            frame.pts = self.pts
-            self.pts += frame.samples  # Increment PTS for next frame
+            frame.pts = self.next_pts
+            # Update next_pts by the number of samples in this frame
+            self.next_pts += frame.samples
             
             return frame
         
         except Exception as e:
             logger.error(f"[PATH: AudioTrack.recv] Error in AudioTrack.recv: {e}", exc_info=True)
             # Return silence frame on error
+            # Initialize next_pts if not set
+            if self.next_pts is None:
+                self.next_pts = 0
+            
             # Create numpy array for silence (48kHz, 10ms = 480 samples)
             # Reshape to 2D: (channels=1, samples=480)
             silence_array = np.zeros((1, 480), dtype=np.int16)
@@ -794,7 +808,8 @@ class AudioTrack(MediaStreamTrack):
                 layout='mono'
             )
             frame.sample_rate = self.sample_rate
-            frame.pts = self.pts
-            self.pts += frame.samples  # Increment PTS for next frame
+            frame.pts = self.next_pts
+            # Update next_pts to keep timeline continuous (480 samples = 10ms at 48kHz)
+            self.next_pts += 480
             return frame
 
