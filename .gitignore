@@ -1,0 +1,5 @@
+.env
+.DS_Store
+sample-frontend/package-lock.json
+/aawaz-poc
+voice-gateway/package-lock.json
