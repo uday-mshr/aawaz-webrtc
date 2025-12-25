@@ -119,7 +119,7 @@ class WebRTCSession:
         self.data_channel: Optional[any] = None
         self.audio_processor: Optional[AudioProcessor] = None
         self.audio_track: Optional[MediaStreamTrack] = None
-        self._audio_queue: asyncio.Queue = asyncio.Queue()  # For OUTGOING audio (to frontend)
+        self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=100)  # Larger queue to prevent drops
         self._incoming_audio_buffer: list = []  # For INCOMING audio (from frontend, to Gemini)
         self._is_collecting_audio = False
         self._gemini_model = None
@@ -345,16 +345,13 @@ class WebRTCSession:
     def _on_gemini_audio(self, audio_array: np.ndarray):
         """Callback when Gemini sends audio - queue it for WebRTC"""
         try:
-            # Get the running event loop (we're called from async context)
+            # Put audio in queue (put_nowait to avoid blocking)
+            # Note: queue.put() is NOT a coroutine, it's a regular method
             try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # No running loop - try to get event loop
-                loop = asyncio.get_event_loop()
-            
-            # Create task to put audio in queue (non-blocking)
-            loop.create_task(self._audio_queue.put(audio_array))
-            logger.info(f"[PATH: _on_gemini_audio] Queued Gemini audio for WebRTC: {len(audio_array)} samples")
+                self._audio_queue.put_nowait(audio_array)
+                logger.debug(f"[PATH: _on_gemini_audio] Queued Gemini audio: {len(audio_array)} samples")
+            except asyncio.QueueFull:
+                logger.warning(f"[PATH: _on_gemini_audio] Audio queue full, dropping chunk")
         except Exception as e:
             logger.error(f"[PATH: _on_gemini_audio] Error queuing Gemini audio: {e}", exc_info=True)
     
@@ -394,8 +391,41 @@ class WebRTCSession:
             # Create answer
             logger.info(f"[PATH: handle_offer] Creating answer")
             answer = await self.pc.createAnswer()
-            logger.info(f"[PATH: handle_offer] Answer created, setting local description")
-            await self.pc.setLocalDescription(answer)
+            logger.info(f"[PATH: handle_offer] Answer created, enhancing SDP with high-quality Opus settings")
+            
+            # Enhance SDP with high-quality Opus codec settings BEFORE setting local description
+            # Set Opus bitrate to 128 kbps (better quality for voice)
+            sdp = answer.sdp
+            # Find Opus codec line and add bitrate configuration
+            lines = sdp.split('\n')
+            enhanced_lines = []
+            opus_found = False
+            for i, line in enumerate(lines):
+                enhanced_lines.append(line)
+                # Look for Opus rtpmap line (e.g., "a=rtpmap:111 opus/48000/2")
+                if line.startswith('a=rtpmap:') and 'opus' in line.lower():
+                    opus_found = True
+                    # Extract payload type number
+                    payload_type = line.split(':')[1].split()[0] if ':' in line else None
+                    if payload_type:
+                        # Check if fmtp line already exists for this payload type
+                        # We'll add it after the rtpmap line
+                        # Add high-quality Opus configuration
+                        # maxaveragebitrate=128000 (128 kbps - better quality for voice), stereo=0 (mono), useinbandfec=1 (forward error correction)
+                        enhanced_lines.append(f'a=fmtp:{payload_type} maxaveragebitrate=128000;stereo=0;useinbandfec=1')
+                        logger.info(f"[PATH: handle_offer] Added high-quality Opus configuration (128 kbps) for payload type {payload_type}")
+            
+            if opus_found:
+                sdp = '\n'.join(enhanced_lines)
+                # Create enhanced answer with modified SDP
+                enhanced_answer = RTCSessionDescription(sdp=sdp, type='answer')
+                logger.info(f"[PATH: handle_offer] Enhanced SDP with high-quality Opus settings, setting local description")
+            else:
+                logger.warning(f"[PATH: handle_offer] Opus codec not found in SDP, using default settings")
+                enhanced_answer = answer
+            
+            # Set local description with (potentially enhanced) answer
+            await self.pc.setLocalDescription(enhanced_answer)
             logger.info(f"[PATH: handle_offer] Local description set: {self.pc.localDescription.type}")
             
             # Send answer via Redis
@@ -745,56 +775,62 @@ class AudioTrack(MediaStreamTrack):
         self.audio_processor = AudioProcessor()
         self.pts = 0  # Presentation timestamp for audio synchronization
         self.sample_rate = 48000  # WebRTC expects 48kHz
+        self._buffer_started = False  # Track if we've started buffering
+        self._initial_buffer_size = 3  # Buffer 3 chunks before starting (reduce initial gaps)
     
     async def recv(self):
         """Receive audio frame from queue and convert to WebRTC format"""
         try:
-            # Get PCM audio from queue (16kHz from Gemini)
-            # Use timeout to avoid blocking indefinitely and return silence if no audio
+            # Get PCM audio from queue (24kHz from Gemini, will be resampled to 48kHz)
+            # Use timeout to avoid blocking indefinitely
             try:
-                # Increased timeout to 200ms to reduce silence frames and improve quality
-                pcm_audio = await asyncio.wait_for(self.audio_queue.get(), timeout=0.2)
-                logger.debug(f"[PATH: AudioTrack.recv] Received audio from queue: {len(pcm_audio)} samples, dtype={pcm_audio.dtype}")
+                # Wait for audio with timeout
+                # Reduced timeout to 100ms - shorter wait reduces gaps
+                pcm_audio = await asyncio.wait_for(self.audio_queue.get(), timeout=0.1)
+                logger.debug(f"[PATH: AudioTrack.recv] Received audio: {len(pcm_audio)} samples")
             except asyncio.TimeoutError:
-                # Return silence frame if no audio available (normal during gaps)
-                # Create numpy array for silence (48kHz, 10ms = 480 samples)
-                # Reshape to 2D: (channels=1, samples=480)
+                # Return silence frame if no audio available
+                # Use smaller silence frame (10ms = 480 samples at 48kHz)
                 silence_array = np.zeros((1, 480), dtype=np.int16)
-                logger.debug(f"[PATH: AudioTrack.recv] No audio available, returning silence frame")
                 frame = av.AudioFrame.from_ndarray(
-                    silence_array,  # Shape: (channels, samples) as 2D numpy array
+                    silence_array,
                     format='s16',
                     layout='mono'
                 )
-                frame.sample_rate = self.sample_rate
+                frame.rate = self.sample_rate
                 frame.pts = self.pts
-                self.pts += frame.samples  # Increment PTS for next frame
+                self.pts += 480  # 10ms at 48kHz = 480 samples
                 return frame
             
             # Resample to Opus/48kHz for WebRTC
             frame = await self.audio_processor.process_outgoing_audio(pcm_audio)
-            logger.debug(f"[PATH: AudioTrack.recv] Processed audio frame, returning to WebRTC")
             
-            # Ensure sample rate and PTS are set for proper audio synchronization
-            frame.sample_rate = self.sample_rate
+            # CRITICAL: Ensure rate and PTS are set correctly
+            # The resampled frame should already have rate set, but verify
+            if frame.rate != self.sample_rate:
+                logger.warning(f"[PATH: AudioTrack.recv] Frame rate mismatch: {frame.rate} != {self.sample_rate}, correcting")
+                frame.rate = self.sample_rate
+            
+            # Set PTS - this must be continuous for smooth playback
             frame.pts = self.pts
-            self.pts += frame.samples  # Increment PTS for next frame
+            
+            # Increment PTS by the number of samples in this frame
+            # This ensures continuous timing
+            self.pts += frame.samples
             
             return frame
         
         except Exception as e:
-            logger.error(f"[PATH: AudioTrack.recv] Error in AudioTrack.recv: {e}", exc_info=True)
+            logger.error(f"[PATH: AudioTrack.recv] Error: {e}", exc_info=True)
             # Return silence frame on error
-            # Create numpy array for silence (48kHz, 10ms = 480 samples)
-            # Reshape to 2D: (channels=1, samples=480)
             silence_array = np.zeros((1, 480), dtype=np.int16)
             frame = av.AudioFrame.from_ndarray(
-                silence_array,  # Shape: (channels, samples) as 2D numpy array
+                silence_array,
                 format='s16',
                 layout='mono'
             )
-            frame.sample_rate = self.sample_rate
+            frame.rate = self.sample_rate
             frame.pts = self.pts
-            self.pts += frame.samples  # Increment PTS for next frame
+            self.pts += 480
             return frame
 

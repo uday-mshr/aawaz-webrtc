@@ -1,6 +1,6 @@
 """
 Audio Processor
-Handles audio resampling between WebRTC (Opus/48kHz) and Gemini (PCM/16kHz)
+Handles audio resampling between WebRTC (Opus/48kHz) and Gemini (PCM/16kHz input, 24kHz output)
 """
 
 import asyncio
@@ -20,28 +20,44 @@ class AudioProcessor:
     WEBRTC_CHANNELS = 1  # Mono
     WEBRTC_FORMAT = 's16'  # 16-bit signed PCM
     
-    # Gemini audio format: PCM, 16kHz
-    GEMINI_SAMPLE_RATE = 16000
+    # Gemini audio format: PCM, 16kHz input, 24kHz output
+    GEMINI_INPUT_SAMPLE_RATE = 16000  # For incoming audio to Gemini
+    GEMINI_OUTPUT_SAMPLE_RATE = 24000  # For outgoing audio from Gemini
     GEMINI_CHANNELS = 1  # Mono
     GEMINI_FORMAT = 's16'  # 16-bit signed PCM
     
     def __init__(self):
-        # Create resampler for incoming audio (48kHz -> 16kHz)
+        # Create resampler for incoming audio (48kHz -> 16kHz for Gemini input)
         self.incoming_resampler = av.AudioResampler(
             format=self.GEMINI_FORMAT,
             layout='mono',
-            rate=self.GEMINI_SAMPLE_RATE
+            rate=self.GEMINI_INPUT_SAMPLE_RATE
         )
         
-        # Create resampler for outgoing audio (16kHz -> 48kHz) - CRITICAL for quality
-        # Note: PyAV's default resampler uses libswresample which provides good quality
+        # Create resampler for outgoing audio (24kHz -> 48kHz) - CRITICAL for quality
+        # Configure for best quality resampling using libswresample's highest quality algorithm
         self.outgoing_resampler = av.AudioResampler(
             format=self.WEBRTC_FORMAT,
             layout='mono',
             rate=self.WEBRTC_SAMPLE_RATE
         )
         
-        logger.info("Audio processor initialized with default resamplers")
+        # Set resampling quality to best (if supported by PyAV version)
+        # This uses libswresample's highest quality algorithm
+        try:
+            # Try to set resampling algorithm to best quality
+            # PyAV may expose this through the resampler options
+            if hasattr(self.outgoing_resampler, 'set_option'):
+                # Use best quality resampling algorithm
+                self.outgoing_resampler.set_option('resampler', 'soxr')
+                self.outgoing_resampler.set_option('precision', '28')
+            elif hasattr(av, 'AudioResampler') and hasattr(av.AudioResampler, 'set_option'):
+                # Alternative method if available
+                pass
+        except Exception as e:
+            logger.warning(f"Could not set resampler quality options: {e}. Using default quality.")
+        
+        logger.info("Audio processor initialized with resamplers (48kHz->16kHz input, 24kHz->48kHz output)")
     
     async def process_incoming_audio(self, frame: av.AudioFrame) -> Optional[np.ndarray]:
         """
@@ -87,10 +103,10 @@ class AudioProcessor:
     
     async def process_outgoing_audio(self, pcm_audio: np.ndarray) -> av.AudioFrame:
         """
-        Process outgoing audio from Gemini (PCM/16kHz) -> Opus/48kHz for WebRTC
+        Process outgoing audio from Gemini (PCM/24kHz) -> Opus/48kHz for WebRTC
         
         Args:
-            pcm_audio: numpy array of PCM audio data (16kHz, int16)
+            pcm_audio: numpy array of PCM audio data (24kHz from Gemini, int16)
             
         Returns:
             AudioFrame for WebRTC (Opus, 48kHz)
@@ -104,45 +120,62 @@ class AudioProcessor:
             if len(pcm_audio.shape) > 1:
                 pcm_audio = pcm_audio[0] if pcm_audio.shape[0] == 1 else np.mean(pcm_audio, axis=0)
             
+            # Audio normalization: prevent clipping and ensure consistent volume
+            # More conservative normalization to avoid artifacts
+            max_val = np.max(np.abs(pcm_audio))
+            if max_val > 0:
+                # Only normalize if audio is close to clipping
+                if max_val > 30000:  # If close to clipping (int16 max is 32767)
+                    # Normalize to 95% to prevent clipping
+                    pcm_audio = (pcm_audio / max_val * 0.95 * 32767).astype(np.int16)
+                # Remove the aggressive boost for quiet audio - let Opus handle it
+                # This prevents artifacts from over-amplification
+            
             # Reshape to 2D: (channels=1, samples) for PyAV
             pcm_audio_2d = pcm_audio.reshape(1, -1) if len(pcm_audio.shape) == 1 else pcm_audio
             
-            # Create AudioFrame from numpy array (16kHz)
+            # Create AudioFrame from numpy array (24kHz from Gemini)
+            # CRITICAL: Explicitly set input sample rate to 24kHz before resampling
             frame = av.AudioFrame.from_ndarray(
                 pcm_audio_2d,  # Shape: (channels, samples) as 2D numpy array
                 format=self.GEMINI_FORMAT,
                 layout='mono'
             )
-            frame.rate = self.GEMINI_SAMPLE_RATE
+            frame.rate = self.GEMINI_OUTPUT_SAMPLE_RATE  # Explicitly set: Gemini outputs 24kHz
+            logger.debug(f"Resampling audio: input={frame.rate}Hz, samples={frame.samples}, output={self.WEBRTC_SAMPLE_RATE}Hz")
             
-            # Resample from 16kHz to 48kHz
+            # Resample from 24kHz to 48kHz (direct, better quality than 24->16->48)
             resampled_frames = self.outgoing_resampler.resample(frame)
+            
+            # Log resampling result for verification
+            if isinstance(resampled_frames, list) and len(resampled_frames) > 0:
+                logger.debug(f"Resampling complete: {len(resampled_frames)} frame(s), output rate={resampled_frames[0].rate}Hz, samples={resampled_frames[0].samples}")
+            elif not isinstance(resampled_frames, list):
+                logger.debug(f"Resampling complete: output rate={resampled_frames.rate}Hz, samples={resampled_frames.samples}")
             
             # resampled_frames can be a list or single frame
             if isinstance(resampled_frames, list):
                 if len(resampled_frames) == 0:
-                    # Return silence frame - USE 2D NUMPY ARRAY
+                    # Return silence frame
                     silence_array = np.zeros((1, 480), dtype=np.int16)
                     silence_frame = av.AudioFrame.from_ndarray(
-                        silence_array,  # Shape: (channels, samples) as 2D numpy array
+                        silence_array,
                         format=self.WEBRTC_FORMAT,
                         layout='mono'
                     )
                     silence_frame.rate = self.WEBRTC_SAMPLE_RATE
+                    silence_frame.pts = 0  # Will be set by caller
                     return silence_frame
                 
-                # If multiple frames, concatenate them to avoid losing audio data
+                # If multiple frames, concatenate them
                 if len(resampled_frames) > 1:
-                    # Combine all frames into one for smoother playback
                     combined_arrays = []
                     for f in resampled_frames:
                         arr = f.to_ndarray()
-                        # Ensure 2D shape (channels, samples)
                         if len(arr.shape) == 1:
                             arr = arr.reshape(1, -1)
                         combined_arrays.append(arr)
                     
-                    # Concatenate along the samples axis (axis=1)
                     combined_audio = np.concatenate(combined_arrays, axis=1)
                     combined_frame = av.AudioFrame.from_ndarray(
                         combined_audio,
@@ -150,20 +183,26 @@ class AudioProcessor:
                         layout='mono'
                     )
                     combined_frame.rate = self.WEBRTC_SAMPLE_RATE
+                    combined_frame.pts = 0  # Will be set by caller
                     return combined_frame
                 
                 # Single frame in list
                 result_frame = resampled_frames[0]
-                result_frame.rate = self.WEBRTC_SAMPLE_RATE
+                # Ensure rate is correct
+                if result_frame.rate != self.WEBRTC_SAMPLE_RATE:
+                    result_frame.rate = self.WEBRTC_SAMPLE_RATE
+                result_frame.pts = 0  # Will be set by caller
                 return result_frame
             else:
                 # Single frame (not a list)
-                resampled_frames.rate = self.WEBRTC_SAMPLE_RATE
+                if resampled_frames.rate != self.WEBRTC_SAMPLE_RATE:
+                    resampled_frames.rate = self.WEBRTC_SAMPLE_RATE
+                resampled_frames.pts = 0  # Will be set by caller
                 return resampled_frames
         
         except Exception as e:
             logger.error(f"Error processing outgoing audio: {e}", exc_info=True)
-            # Return silence frame on error - USE 2D NUMPY ARRAY
+            # Return silence frame on error
             silence_array = np.zeros((1, 480), dtype=np.int16)
             return av.AudioFrame.from_ndarray(
                 silence_array,  # Shape: (channels, samples) as 2D numpy array

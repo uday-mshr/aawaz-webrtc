@@ -43,14 +43,8 @@ interface UseAudioStreamReturn {
 }
 
 const DEFAULT_SAMPLE_RATE = 16000; // Gemini requirement
-const JITTER_BUFFER_MS = 100; // 100ms jitter buffer for smooth playback
-const MIN_READY_CHUNKS = 3; // soft prime before starting playback
-const AI_FINGERPRINT_WINDOW_SEC = 1.5; // retain ~1.5s of AI playback energy
-const AI_FINGERPRINT_SAMPLES = 512; // small snippet to correlate against
-const DEBUG_AUDIO_GATE = false; // set true to trace gate decisions in console (manual checks: laptop-speaker echo should be gated; speaking over AI should clear playback and capture user)
 const HEARTBEAT_INTERVAL_MS = 15000; // 15 seconds
 const RECONNECT_DELAY_MS = 1000; // 1 second delay before reconnecting
-const MIN_BUFFER_SIZE_BYTES = 4096; // hard floor to avoid tiny "crumb" frames
 const SPEAKING_DEBOUNCE_MS = 300; // debounce barge-in to ignore coughs/clicks
 
 /**
@@ -105,18 +99,7 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
   const currentUserMessageRef = useRef<string>('');
   const messageIdCounterRef = useRef(0);
 
-  // Refs for audio playback with jitter buffer
-  const activeAudioSourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const nextPlayTimeRef = useRef<number>(0);
-  const jitterBufferRef = useRef<Array<{ audio: Float32Array; timestamp: number }>>([]);
-  const jitterBufferProcessingRef = useRef(false);
-  const firstChunkTimeRef = useRef<number | null>(null); // AudioContext time when first chunk arrived
-  const aiPlaybackEnergyRef = useRef<Array<{
-    timestamp: number;
-    rms: number;
-    peak: number;
-    fingerprint: Float32Array;
-  }>>([]);
+  // Refs for audio playback (using native WebRTC NetEQ jitter buffer)
   const speakingTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   /**
@@ -174,131 +157,13 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
   }, []);
 
   /**
-   * Lightweight audio stats helpers
+   * Update AI speaking state based on audio element playback
    */
-  const computeRms = useCallback((audioData: Float32Array): number => {
-    let sumSquares = 0;
-    for (let i = 0; i < audioData.length; i++) {
-      const sample = audioData[i];
-      sumSquares += sample * sample;
-    }
-    return Math.sqrt(sumSquares / audioData.length);
-  }, []);
+  const updateAiSpeakingState = useCallback((isSpeaking: boolean) => {
+    setIsAiSpeaking(isSpeaking);
+    isAiSpeakingRef.current = isSpeaking;
 
-  const computePeak = useCallback((audioData: Float32Array): number => {
-    let peak = 0;
-    for (let i = 0; i < audioData.length; i++) {
-      const value = Math.abs(audioData[i]);
-      if (value > peak) {
-        peak = value;
-      }
-    }
-    return peak;
-  }, []);
-
-  const computeCorrelation = useCallback((a: Float32Array, b: Float32Array): number => {
-    const length = Math.min(a.length, b.length, AI_FINGERPRINT_SAMPLES);
-    if (length === 0) return 0;
-
-    let dot = 0;
-    let sumASq = 0;
-    let sumBSq = 0;
-
-    for (let i = 0; i < length; i++) {
-      const av = a[i];
-      const bv = b[i];
-      dot += av * bv;
-      sumASq += av * av;
-      sumBSq += bv * bv;
-    }
-
-    const denom = Math.sqrt(sumASq) * Math.sqrt(sumBSq) || 1;
-    return dot / denom;
-  }, []);
-
-  /**
-   * Track AI playback fingerprint for gating
-   */
-  const trackAiPlayback = useCallback((audioData: Float32Array) => {
-    if (!audioContextRef.current) return;
-    const timestamp = audioContextRef.current.currentTime;
-    const rms = computeRms(audioData);
-    const peak = computePeak(audioData);
-    const snippet = audioData.length > AI_FINGERPRINT_SAMPLES
-      ? audioData.subarray(0, AI_FINGERPRINT_SAMPLES)
-      : audioData;
-    const fingerprint =
-      snippet.length === AI_FINGERPRINT_SAMPLES
-        ? snippet
-        : (() => {
-            // Pad to consistent length so correlation stays stable
-            const padded = new Float32Array(AI_FINGERPRINT_SAMPLES);
-            padded.set(snippet);
-            return padded;
-          })();
-
-    aiPlaybackEnergyRef.current.push({
-      timestamp,
-      rms,
-      peak,
-      fingerprint,
-    });
-
-    // Keep only recent fingerprints
-    const windowStart = timestamp - AI_FINGERPRINT_WINDOW_SEC;
-    aiPlaybackEnergyRef.current = aiPlaybackEnergyRef.current.filter((entry) => entry.timestamp >= windowStart);
-  }, [computePeak, computeRms]);
-
-  /**
-   * Decide whether to gate mic frames due to AI playback leak
-   */
-  const shouldGateAudio = useCallback((audioData: Float32Array): boolean => {
-    // Never gate while VAD says the user is speaking (preserve barge-in)
-    if (isUserSpeakingRef.current) {
-      return false;
-    }
-
-    const audioContext = audioContextRef.current;
-    const now = audioContext ? audioContext.currentTime : performance.now() / 1000;
-    const recent = aiPlaybackEnergyRef.current.filter((entry) => (now - entry.timestamp) <= AI_FINGERPRINT_WINDOW_SEC);
-    if (!recent.length) return false;
-
-    const micRms = computeRms(audioData);
-    const micPeak = computePeak(audioData);
-    const avgAiRms = recent.reduce((sum, entry) => sum + entry.rms, 0) / recent.length;
-    const avgAiPeak = recent.reduce((sum, entry) => sum + entry.peak, 0) / recent.length;
-    const latestFingerprint = recent[recent.length - 1].fingerprint;
-    const correlation = computeCorrelation(audioData, latestFingerprint);
-
-    const energyMatch = micRms <= avgAiRms * 1.15 && micPeak <= avgAiPeak * 1.1;
-    const correlated = correlation >= 0.7;
-
-    const gate = (energyMatch || correlated) && isAiSpeakingRef.current;
-
-    if (DEBUG_AUDIO_GATE && gate) {
-      console.debug('[audio-gate] gating chunk', {
-        micRms,
-        micPeak,
-        avgAiRms,
-        avgAiPeak,
-        correlation,
-        recentFingerprints: recent.length,
-        isAiSpeaking: isAiSpeakingRef.current,
-      });
-    }
-
-    return gate;
-  }, [computeCorrelation, computePeak, computeRms]);
-
-  /**
-   * Update AI speaking state based on active audio sources
-   */
-  const updateAiSpeakingState = useCallback(() => {
-    const hasActiveAudio = activeAudioSourcesRef.current.length > 0;
-    setIsAiSpeaking(hasActiveAudio);
-    isAiSpeakingRef.current = hasActiveAudio;
-
-    if (hasActiveAudio) {
+    if (isSpeaking) {
       setAiStatus('typing');
     } else if (!isUserSpeakingRef.current) {
       setAiStatus('listening');
@@ -306,161 +171,19 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
   }, []);
 
   /**
-   * Clear playback buffer (for barge-in/interruption)
+   * Clear playback (for barge-in/interruption)
+   * WebRTC handles jitter buffering automatically via NetEQ
+   * We don't need to pause - WebRTC will handle the interruption naturally
    */
   const clearPlayback = useCallback(() => {
-    // Stop all active audio sources
-    activeAudioSourcesRef.current.forEach((source) => {
-      try {
-        source.stop();
-        source.disconnect();
-      } catch (e) {
-        // Source may have already ended or been stopped
-      }
-    });
-    activeAudioSourcesRef.current = [];
-
-    // Clear jitter buffer
-    jitterBufferRef.current = [];
-    firstChunkTimeRef.current = null;
-    jitterBufferProcessingRef.current = false;
-    aiPlaybackEnergyRef.current = [];
-
-    // Reset playback timing
-    if (audioContextRef.current) {
-      nextPlayTimeRef.current = audioContextRef.current.currentTime;
-    }
-    
-    // Update AI speaking state
-    updateAiSpeakingState();
+    // Don't pause the audio element - let WebRTC's NetEQ handle buffering
+    // The stream will naturally pause/resume based on data availability
+    // Just update the state
+    updateAiSpeakingState(false);
   }, [updateAiSpeakingState]);
 
-  /**
-   * Process jitter buffer and play audio chunks
-   */
-  const processJitterBuffer = useCallback(() => {
-    if (jitterBufferProcessingRef.current || !audioContextRef.current) {
-      return;
-    }
-
-    jitterBufferProcessingRef.current = true;
-    const audioContext = audioContextRef.current;
-    const GEMINI_SAMPLE_RATE = 24000; // Gemini outputs 24kHz audio
-    const now = audioContext.currentTime;
-    const playTime = now + (JITTER_BUFFER_MS / 1000); // Add jitter buffer delay
-
-    // Sort buffer by timestamp to handle out-of-order packets
-    jitterBufferRef.current.sort((a, b) => a.timestamp - b.timestamp);
-
-    // Process all chunks that are ready to play
-    const readyChunks: Array<{ audio: Float32Array; timestamp: number }> = [];
-    const remainingChunks: typeof jitterBufferRef.current = [];
-
-    // Process chunks: if timestamp is in the past (accounting for jitter buffer delay), they're ready
-    const readyThreshold = now - (JITTER_BUFFER_MS / 1000); // Allow chunks up to jitter buffer delay in the past
-    for (const chunk of jitterBufferRef.current) {
-      // Chunks are ready if their timestamp is before the ready threshold
-      // This accounts for network delay and ensures smooth playback
-      if (chunk.timestamp <= readyThreshold) {
-        readyChunks.push(chunk);
-      } else {
-        remainingChunks.push(chunk);
-      }
-    }
-
-    jitterBufferRef.current = remainingChunks;
-
-    // If we don't have enough priming chunks and nothing is currently playing, hold until buffer fills
-    if (activeAudioSourcesRef.current.length === 0 && readyChunks.length > 0 && readyChunks.length < MIN_READY_CHUNKS) {
-      jitterBufferRef.current.push(...readyChunks);
-      jitterBufferRef.current.sort((a, b) => a.timestamp - b.timestamp);
-      jitterBufferProcessingRef.current = false;
-      setTimeout(processJitterBuffer, 10);
-      return;
-    }
-
-    // Play all ready chunks
-    let currentPlayTime = Math.max(playTime, nextPlayTimeRef.current);
-    
-    for (const { audio: audioData } of readyChunks) {
-      try {
-        const buffer = audioContext.createBuffer(1, audioData.length, GEMINI_SAMPLE_RATE);
-        buffer.copyToChannel(audioData, 0);
-
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-
-        activeAudioSourcesRef.current.push(source);
-        trackAiPlayback(audioData);
-        source.start(currentPlayTime);
-        // Update AI speaking state when audio starts playing
-        updateAiSpeakingState();
-
-        // Clean up when playback ends
-        source.onended = () => {
-          const index = activeAudioSourcesRef.current.indexOf(source);
-          if (index > -1) {
-            activeAudioSourcesRef.current.splice(index, 1);
-          }
-          // Update AI speaking state when source ends
-          updateAiSpeakingState();
-        };
-
-        currentPlayTime += buffer.duration;
-      } catch (error) {
-        console.error('Error playing audio chunk:', error);
-      }
-    }
-
-    nextPlayTimeRef.current = currentPlayTime;
-
-    // Schedule next processing
-    if (jitterBufferRef.current.length > 0) {
-      setTimeout(() => {
-        jitterBufferProcessingRef.current = false;
-        processJitterBuffer();
-      }, 10); // Check every 10ms
-    } else {
-      jitterBufferProcessingRef.current = false;
-    }
-  }, [trackAiPlayback, updateAiSpeakingState]);
-
-  /**
-   * Handle incoming audio from WebSocket with jitter buffer
-   */
-  const handleIncomingAudio = useCallback(async (audioData: Float32Array) => {
-    try {
-      // Drop/clear AI audio while user is speaking to avoid overlap
-      if (isUserSpeakingRef.current) {
-        clearPlayback();
-        return;
-      }
-
-      if (!audioContextRef.current) {
-        return;
-      }
-
-      // Use AudioContext time (in seconds) for timestamps to match comparison logic
-      const audioContext = audioContextRef.current;
-      const timestamp = audioContext.currentTime;
-      
-      // Track first chunk time for relative timing
-      if (firstChunkTimeRef.current === null) {
-        firstChunkTimeRef.current = timestamp;
-      }
-      
-      // Add to jitter buffer with AudioContext time (seconds)
-      jitterBufferRef.current.push({ audio: audioData, timestamp });
-      trackAiPlayback(audioData);
-
-      // Trigger processing
-      processJitterBuffer();
-    } catch (error) {
-      console.error('Error handling incoming audio:', error);
-      onError?.(error as Error);
-    }
-  }, [processJitterBuffer, updateAiSpeakingState, clearPlayback, trackAiPlayback, onError]);
+  // Removed manual jitter buffer - WebRTC's NetEQ handles this automatically
+  // Removed custom echo cancellation - browser's hardware AEC handles this
 
   /**
    * Resample audio to target sample rate
@@ -529,7 +252,7 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
         if (!audioElementRef.current) {
           const audio = document.createElement('audio');
           audio.autoplay = true;
-          audio.playsInline = true;
+          (audio as any).playsInline = true; // For mobile browsers
           
           // Add error handlers
           audio.onerror = (e) => {
@@ -549,27 +272,29 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
           
           audio.onplay = () => {
             console.log('Audio started playing');
-            setAiStatus('speaking');
-            setIsAiSpeaking(true);
-            isAiSpeakingRef.current = true;
+            updateAiSpeakingState(true);
           };
           
           audio.onpause = () => {
             console.log('Audio paused');
+            updateAiSpeakingState(false);
           };
           
           audio.onended = () => {
             console.log('Audio ended');
+            updateAiSpeakingState(false);
           };
           
           // Track audio data flow
           const track = event.track;
           track.onmute = () => {
             console.warn('Audio track muted');
+            updateAiSpeakingState(false);
           };
           
           track.onunmute = () => {
             console.log('Audio track unmuted');
+            // Audio will resume automatically via WebRTC
           };
           
           document.body.appendChild(audio);
@@ -578,19 +303,20 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
         
         // Attach stream to audio element
         const stream = new MediaStream([event.track]);
+        const wasPaused = audioElementRef.current.paused;
         audioElementRef.current.srcObject = stream;
         
-        // Explicitly try to play (required by some browsers)
+        // CRITICAL: Always try to play when setting srcObject
+        // This ensures audio resumes after being paused during barge-in
+        if (wasPaused || audioElementRef.current.paused) {
         audioElementRef.current.play().catch(err => {
           console.error('Failed to autoplay audio:', err);
-          // User interaction might be required
         });
+        }
         
         console.log('Audio track attached to audio element, stream:', stream.id, 'track:', event.track.id);
         
-        setAiStatus('typing');
-        setIsAiSpeaking(true);
-        isAiSpeakingRef.current = true;
+        // AI speaking state will be updated by audio element events (onplay/onpause/onended)
       }
     };
 
@@ -621,7 +347,12 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
         console.warn(`WebRTC connection ${state}`);
         setConnectionState('disconnected');
         setIsRecording(false);
-        clearPlayback();
+        // Clear playback on disconnect
+        if (audioElementRef.current) {
+          audioElementRef.current.pause();
+          audioElementRef.current.srcObject = null;
+        }
+        updateAiSpeakingState(false);
       }
     };
     
@@ -802,7 +533,7 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
       console.error('Socket.IO error:', error);
       onError?.(new Error('Socket.IO connection error'));
     });
-  }, [socketUrl, sessionId, persona, clearPlayback, onError]);
+  }, [socketUrl, sessionId, persona, updateAiSpeakingState, onError]);
 
   /**
    * End audio call
@@ -882,12 +613,7 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
       audioContextRef.current = null;
     }
 
-    // Clear refs
-    activeAudioSourcesRef.current = [];
-    nextPlayTimeRef.current = 0;
-    jitterBufferRef.current = [];
-    jitterBufferProcessingRef.current = false;
-    firstChunkTimeRef.current = null;
+    // Clear refs (jitter buffer and echo cancellation removed - handled by WebRTC/browser)
 
     setConnectionState('disconnected');
     setIsRecording(false);
@@ -903,10 +629,12 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
       shouldReconnectRef.current = true;
       setAiStatus('listening');
 
-      // Create AudioContext
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      // Create AudioContext for VAD processing (not needed for WebRTC playback which uses native audio element)
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: 48000, // Match WebRTC sample rate
+        latencyHint: 'interactive' // Low latency for real-time communication
+      });
       audioContextRef.current = audioContext;
-      nextPlayTimeRef.current = audioContext.currentTime;
 
       // Get user media with strict constraints
       const getStream = async () => {
@@ -982,9 +710,8 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
             setAiStatus('listening');
             currentUserMessageRef.current = '';
             setMessages((prev) => prev.filter((msg) => !(msg.role === 'user' && msg.isPartial)));
-            if (activeAudioSourcesRef.current.length > 0) {
+            // Clear AI playback on barge-in
               clearPlayback();
-            }
             // Send turn start signal via WebRTC data channel
             sendDataChannelMessage({ type: 'turn_start' });
           }, SPEAKING_DEBOUNCE_MS);
@@ -1124,7 +851,7 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
       onError?.(error as Error);
       endCall();
     }
-  }, [targetSampleRate, setupWebRTC, clearPlayback, endCall, onError, sendDataChannelMessage]);
+  }, [targetSampleRate, setupWebRTC, clearPlayback, endCall, onError, sendDataChannelMessage, updateAiSpeakingState]);
 
   // Cleanup on unmount
   useEffect(() => {
