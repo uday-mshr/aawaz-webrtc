@@ -345,11 +345,30 @@ class WebRTCSession:
     def _on_gemini_audio(self, audio_array: np.ndarray):
         """Callback when Gemini sends audio - queue it for WebRTC"""
         try:
+            # CRITICAL: Ensure audio_array is always a numpy array, never a Python list
+            # This prevents PyAV crashes: AttributeError: 'list' object has no attribute 'dtype'
+            if not isinstance(audio_array, np.ndarray):
+                if isinstance(audio_array, (list, tuple)):
+                    # Convert list/tuple to numpy array
+                    audio_array = np.array(audio_array, dtype=np.int16)
+                    logger.warning(f"[PATH: _on_gemini_audio] Converted list/tuple to numpy array: {type(audio_array)}")
+                else:
+                    # Try to convert bytes or other types
+                    try:
+                        audio_array = np.frombuffer(audio_array, dtype=np.int16)
+                    except (TypeError, ValueError):
+                        logger.error(f"[PATH: _on_gemini_audio] Cannot convert audio data to numpy array: {type(audio_array)}")
+                        return
+            
+            # Ensure dtype is int16
+            if audio_array.dtype != np.int16:
+                audio_array = audio_array.astype(np.int16)
+            
             # Put audio in queue (put_nowait to avoid blocking)
             # Note: queue.put() is NOT a coroutine, it's a regular method
             try:
                 self._audio_queue.put_nowait(audio_array)
-                logger.debug(f"[PATH: _on_gemini_audio] Queued Gemini audio: {len(audio_array)} samples")
+                logger.debug(f"[PATH: _on_gemini_audio] Queued Gemini audio: {len(audio_array)} samples, dtype={audio_array.dtype}")
             except asyncio.QueueFull:
                 logger.warning(f"[PATH: _on_gemini_audio] Audio queue full, dropping chunk")
         except Exception as e:
@@ -410,10 +429,10 @@ class WebRTCSession:
                     if payload_type:
                         # Check if fmtp line already exists for this payload type
                         # We'll add it after the rtpmap line
-                        # Add high-quality Opus configuration
-                        # maxaveragebitrate=128000 (128 kbps - better quality for voice), stereo=0 (mono), useinbandfec=1 (forward error correction)
-                        enhanced_lines.append(f'a=fmtp:{payload_type} maxaveragebitrate=128000;stereo=0;useinbandfec=1')
-                        logger.info(f"[PATH: handle_offer] Added high-quality Opus configuration (128 kbps) for payload type {payload_type}")
+                        # Add high-quality Opus configuration for mono voice
+                        # maxaveragebitrate=64000 (64 kbps is plenty for high-quality mono voice), stereo=0 (mono), useinbandfec=1 (forward error correction)
+                        enhanced_lines.append(f'a=fmtp:{payload_type} maxaveragebitrate=64000;stereo=0;useinbandfec=1')
+                        logger.info(f"[PATH: handle_offer] Added high-quality Opus configuration (64 kbps mono) for payload type {payload_type}")
             
             if opus_found:
                 sdp = '\n'.join(enhanced_lines)
@@ -651,6 +670,11 @@ class WebRTCSession:
         logger.info(f"[PATH: _handle_turn_complete] User turn completed, collected {len(self._incoming_audio_buffer)} audio chunks for session: {self.session_id}")
         self._is_collecting_audio = False
         
+        # CRITICAL: Add natural "breath" pause before signaling activity end
+        # This prevents the AI from snapping back instantly after user stops speaking
+        # The 0.6s delay creates a more natural conversation flow
+        await asyncio.sleep(0.6)
+        
         # Signal activity end to Gemini
         if self.gemini_proxy:
             logger.info(f"[PATH: _handle_turn_complete] Signaling activity_end to Gemini")
@@ -773,34 +797,45 @@ class AudioTrack(MediaStreamTrack):
         super().__init__()
         self.audio_queue = audio_queue
         self.audio_processor = AudioProcessor()
-        self.pts = 0  # Presentation timestamp for audio synchronization
+        self.next_pts = None  # Presentation timestamp for audio synchronization (initialized to None)
         self.sample_rate = 48000  # WebRTC expects 48kHz
-        self._buffer_started = False  # Track if we've started buffering
-        self._initial_buffer_size = 3  # Buffer 3 chunks before starting (reduce initial gaps)
+        self._buffering = True  # Start in buffering mode
+        self._buffer_level = 5  # Number of chunks to buffer before starting playback
+    
+    def _create_silence_frame(self) -> av.AudioFrame:
+        """Create a silence frame (10ms of zeros at 48kHz)"""
+        silence_array = np.zeros((1, 480), dtype=np.int16)  # 10ms at 48kHz = 480 samples
+        frame = av.AudioFrame.from_ndarray(
+            silence_array,
+            format='s16',
+            layout='mono'
+        )
+        frame.rate = self.sample_rate
+        frame.pts = self.pts
+        self.pts += 480  # 10ms at 48kHz = 480 samples
+        return frame
     
     async def recv(self):
         """Receive audio frame from queue and convert to WebRTC format"""
         try:
-            # Get PCM audio from queue (24kHz from Gemini, will be resampled to 48kHz)
-            # Use timeout to avoid blocking indefinitely
+            # 1. Handle Buffering State
+            if self._buffering:
+                if self.audio_queue.qsize() >= self._buffer_level:
+                    self._buffering = False
+                    logger.info("[PATH: AudioTrack.recv] Buffer filled, starting playback")
+                else:
+                    return self._create_silence_frame()
+            
+            # 2. Fetch Data
             try:
-                # Wait for audio with timeout
-                # Reduced timeout to 100ms - shorter wait reduces gaps
-                pcm_audio = await asyncio.wait_for(self.audio_queue.get(), timeout=0.1)
-                logger.debug(f"[PATH: AudioTrack.recv] Received audio: {len(pcm_audio)} samples")
+                # Keep the 0.5s timeout
+                pcm_audio = await asyncio.wait_for(self.audio_queue.get(), timeout=0.5)
+                logger.debug(f"[PATH: AudioTrack.recv] Received audio: {len(pcm_audio)} samples, queue size: {self.audio_queue.qsize()}")
             except asyncio.TimeoutError:
-                # Return silence frame if no audio available
-                # Use smaller silence frame (10ms = 480 samples at 48kHz)
-                silence_array = np.zeros((1, 480), dtype=np.int16)
-                frame = av.AudioFrame.from_ndarray(
-                    silence_array,
-                    format='s16',
-                    layout='mono'
-                )
-                frame.rate = self.sample_rate
-                frame.pts = self.pts
-                self.pts += 480  # 10ms at 48kHz = 480 samples
-                return frame
+                # 3. Handle Underrun
+                logger.warning("[PATH: AudioTrack.recv] Buffer underrun, switching to buffering mode")
+                self._buffering = True
+                return self._create_silence_frame()
             
             # Resample to Opus/48kHz for WebRTC
             frame = await self.audio_processor.process_outgoing_audio(pcm_audio)
@@ -823,14 +858,5 @@ class AudioTrack(MediaStreamTrack):
         except Exception as e:
             logger.error(f"[PATH: AudioTrack.recv] Error: {e}", exc_info=True)
             # Return silence frame on error
-            silence_array = np.zeros((1, 480), dtype=np.int16)
-            frame = av.AudioFrame.from_ndarray(
-                silence_array,
-                format='s16',
-                layout='mono'
-            )
-            frame.rate = self.sample_rate
-            frame.pts = self.pts
-            self.pts += 480
-            return frame
+            return self._create_silence_frame()
 

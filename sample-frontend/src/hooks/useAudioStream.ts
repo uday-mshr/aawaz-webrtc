@@ -301,7 +301,10 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
           audioElementRef.current = audio;
         }
         
-        // Attach stream to audio element
+        // CRITICAL: Attach stream directly to native HTML audio element
+        // This relies on the browser's native NetEQ jitter buffer (not custom JavaScript buffering)
+        // WebRTC's NetEQ handles jitter, packet loss, and timing automatically
+        // DO NOT use custom ScriptProcessor, AudioWorklet, or manual buffering arrays for playback
         const stream = new MediaStream([event.track]);
         const wasPaused = audioElementRef.current.paused;
         audioElementRef.current.srcObject = stream;
@@ -643,7 +646,7 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
           channelCount: 1,
           echoCancellation: supported.echoCancellation !== false ? true : undefined,
           noiseSuppression: supported.noiseSuppression !== false ? true : undefined,
-          autoGainControl: supported.autoGainControl !== false ? true : undefined,
+          autoGainControl: false, // Disable AGC to prevent browser from ducking volume aggressively
           sampleRate: (supported as any).sampleRate || supported.sampleRate === undefined ? targetSampleRate : undefined,
           suppressLocalAudioPlayback: (supported as any).suppressLocalAudioPlayback !== false ? true : undefined,
         };

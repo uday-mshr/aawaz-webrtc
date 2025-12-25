@@ -38,19 +38,22 @@ class AudioProcessor:
             rate=self.GEMINI_INPUT_SAMPLE_RATE
         )
         
-        # Create resampler for outgoing audio (24kHz -> 48kHz) - CRITICAL for quality
-        # Configure for best quality resampling using libswresample's highest quality algorithm
+        # Create resampler for outgoing audio (24kHz -> 48kHz)
+        # CRITICAL: Ensure format='s16', layout='mono', rate=48000 are strictly set
         self.outgoing_resampler = av.AudioResampler(
-            format=self.WEBRTC_FORMAT,
-            layout='mono',
-            rate=self.WEBRTC_SAMPLE_RATE
+            format=self.WEBRTC_FORMAT,  # 's16' - 16-bit signed PCM
+            layout='mono',  # Mono channel layout
+            rate=self.WEBRTC_SAMPLE_RATE  # 48000 Hz for WebRTC
         )
+<<<<<<< Updated upstream
 
         self._configure_resampler(self.incoming_resampler, direction="incoming")
         self._configure_resampler(self.outgoing_resampler, direction="outgoing")
 
         self._outgoing_buffer = np.zeros(0, dtype=np.int16)
         self._smoothed_gain = 1.0
+=======
+>>>>>>> Stashed changes
         
         logger.info("Audio processor initialized with resamplers (48kHz->16kHz input, 24kHz->48kHz output)")
 
@@ -156,11 +159,16 @@ class AudioProcessor:
             AudioFrame for WebRTC (Opus, 48kHz)
         """
         try:
-            # Ensure int16 format
-            if pcm_audio.dtype != np.int16:
+            # CRITICAL: Ensure input is int16 format
+            # If pcm_audio comes from raw bytes, use np.frombuffer with dtype=np.int16
+            if not isinstance(pcm_audio, np.ndarray):
+                # If it's bytes, convert using frombuffer
+                pcm_audio = np.frombuffer(pcm_audio, dtype=np.int16)
+            elif pcm_audio.dtype != np.int16:
                 pcm_audio = pcm_audio.astype(np.int16)
             
             # Ensure 1D array (mono)
+<<<<<<< Updated upstream
             pcm_audio = self._to_mono(pcm_audio)
 
             # Buffer and frame the audio to stable 20ms chunks (prevents jitter/stutter)
@@ -178,18 +186,27 @@ class AudioProcessor:
                 self._outgoing_buffer = np.zeros(0, dtype=np.int16)
 
             frame_audio = self._apply_limiter(frame_audio)
+=======
+            if len(pcm_audio.shape) > 1:
+                pcm_audio = pcm_audio[0] if pcm_audio.shape[0] == 1 else np.mean(pcm_audio, axis=0)
+>>>>>>> Stashed changes
             
             # Reshape to 2D: (channels=1, samples) for PyAV
             pcm_audio_2d = frame_audio.reshape(1, -1)
             
             # Create AudioFrame from numpy array (24kHz from Gemini)
-            # CRITICAL: Explicitly set input sample rate to 24kHz before resampling
+            # CRITICAL: Explicitly set input sample rate to 24kHz BEFORE resampling
             frame = av.AudioFrame.from_ndarray(
                 pcm_audio_2d,  # Shape: (channels, samples) as 2D numpy array
-                format=self.GEMINI_FORMAT,
-                layout='mono'
+                format=self.GEMINI_FORMAT,  # 's16' format
+                layout='mono'  # Mono layout
             )
-            frame.rate = self.GEMINI_OUTPUT_SAMPLE_RATE  # Explicitly set: Gemini outputs 24kHz
+            # CRITICAL: Set sample rate to 24kHz (Gemini output rate) BEFORE calling resample()
+            # PyAV must know the input is 24kHz to avoid distortion
+            frame.rate = self.GEMINI_OUTPUT_SAMPLE_RATE  # 24000 Hz - Gemini outputs 24kHz
+            # Also set sample_rate attribute if it exists (some PyAV versions use this)
+            if hasattr(frame, 'sample_rate'):
+                frame.sample_rate = self.GEMINI_OUTPUT_SAMPLE_RATE
             logger.debug(f"Resampling audio: input={frame.rate}Hz, samples={frame.samples}, output={self.WEBRTC_SAMPLE_RATE}Hz")
             
             # Resample from 24kHz to 48kHz (direct, better quality than 24->16->48)

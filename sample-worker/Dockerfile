@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     libswscale-dev \
     libswresample-dev \
     libavfilter-dev \
+    libsoxr-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
