@@ -464,8 +464,74 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
       }
       
       function createWebRTCOffer() {
-        // Create offer
-        pc.createOffer().then(async (offer) => {
+        // Create offer with codec preferences
+        pc.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: false
+        }).then(async (offer) => {
+          // Enhance SDP to prefer high-quality Opus codec
+          let sdp = offer.sdp;
+          const lines = sdp.split('\n');
+          const mLineIndex = lines.findIndex(line => line.startsWith('m=audio'));
+          
+          if (mLineIndex !== -1) {
+            // Find Opus payload type
+            let opusPayloadType: string | null = null;
+            for (let i = mLineIndex; i < lines.length; i++) {
+              if (lines[i].includes('opus/48000')) {
+                const match = lines[i].match(/^a=rtpmap:(\d+)\s+opus/);
+                if (match) {
+                  opusPayloadType = match[1];
+                  break;
+                }
+              }
+            }
+            
+            if (opusPayloadType) {
+              // Move Opus to first position in m=audio line for preference
+              const mLine = lines[mLineIndex];
+              const parts = mLine.split(' ');
+              const payloadTypes = parts.slice(3);
+              const opusIndex = payloadTypes.indexOf(opusPayloadType);
+              if (opusIndex > 0) {
+                payloadTypes.splice(opusIndex, 1);
+                payloadTypes.unshift(opusPayloadType);
+                lines[mLineIndex] = parts.slice(0, 3).join(' ') + ' ' + payloadTypes.join(' ');
+              }
+              
+              // Add or update high-quality Opus fmtp line
+              let hasFmtp = false;
+              let fmtpIndex = -1;
+              for (let i = mLineIndex; i < lines.length; i++) {
+                if (lines[i].includes(`a=fmtp:${opusPayloadType}`)) {
+                  hasFmtp = true;
+                  fmtpIndex = i;
+                  // Update existing fmtp to ensure high quality
+                  if (!lines[i].includes('maxaveragebitrate=96000')) {
+                    lines[i] = `a=fmtp:${opusPayloadType} maxaveragebitrate=96000;stereo=0;useinbandfec=1;maxplaybackrate=48000`;
+                  }
+                  break;
+                }
+              }
+              
+              if (!hasFmtp) {
+                // Insert fmtp after rtpmap
+                const rtpmapIndex = lines.findIndex((line, idx) => 
+                  idx > mLineIndex && line.includes(`a=rtpmap:${opusPayloadType}`)
+                );
+                if (rtpmapIndex !== -1) {
+                  lines.splice(rtpmapIndex + 1, 0, 
+                    `a=fmtp:${opusPayloadType} maxaveragebitrate=96000;stereo=0;useinbandfec=1;maxplaybackrate=48000`
+                  );
+                }
+              }
+              
+              sdp = lines.join('\n');
+              offer.sdp = sdp;
+              console.log('Enhanced SDP with high-quality Opus codec preferences');
+            }
+          }
+          
           await pc.setLocalDescription(offer);
           
           // Send offer via Socket.IO
@@ -475,7 +541,7 @@ export function useAudioStream(options: UseAudioStreamOptions = {}): UseAudioStr
             sessionId: sessionId,
             persona: persona
           });
-          console.log('Sent WebRTC offer');
+          console.log('Sent WebRTC offer with high-quality Opus codec');
         }).catch((error) => {
           console.error('Error creating offer:', error);
           onError?.(error as Error);

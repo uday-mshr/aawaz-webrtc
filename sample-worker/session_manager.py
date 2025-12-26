@@ -119,7 +119,7 @@ class WebRTCSession:
         self.data_channel: Optional[any] = None
         self.audio_processor: Optional[AudioProcessor] = None
         self.audio_track: Optional[MediaStreamTrack] = None
-        self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=100)  # Larger queue to prevent drops
+        self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=0)  # Unbounded queue to prevent drops
         self._incoming_audio_buffer: list = []  # For INCOMING audio (from frontend, to Gemini)
         self._is_collecting_audio = False
         self._gemini_model = None
@@ -430,9 +430,9 @@ class WebRTCSession:
                         # Check if fmtp line already exists for this payload type
                         # We'll add it after the rtpmap line
                         # Add high-quality Opus configuration for mono voice
-                        # maxaveragebitrate=64000 (64 kbps is plenty for high-quality mono voice), stereo=0 (mono), useinbandfec=1 (forward error correction)
-                        enhanced_lines.append(f'a=fmtp:{payload_type} maxaveragebitrate=64000;stereo=0;useinbandfec=1')
-                        logger.info(f"[PATH: handle_offer] Added high-quality Opus configuration (64 kbps mono) for payload type {payload_type}")
+                        # maxaveragebitrate=96000 (96 kbps for high-quality mono voice), stereo=0 (mono), useinbandfec=1 (forward error correction), maxplaybackrate=48000
+                        enhanced_lines.append(f'a=fmtp:{payload_type} maxaveragebitrate=96000;stereo=0;useinbandfec=1;maxplaybackrate=48000')
+                        logger.info(f"[PATH: handle_offer] Added high-quality Opus configuration (96 kbps mono) for payload type {payload_type}")
             
             if opus_found:
                 sdp = '\n'.join(enhanced_lines)
@@ -797,7 +797,7 @@ class AudioTrack(MediaStreamTrack):
         super().__init__()
         self.audio_queue = audio_queue
         self.audio_processor = AudioProcessor()
-        self.next_pts = None  # Presentation timestamp for audio synchronization (initialized to None)
+        self.pts = 0  # Presentation timestamp for audio synchronization (initialized to 0)
         self.sample_rate = 48000  # WebRTC expects 48kHz
         self._buffering = True  # Start in buffering mode
         self._buffer_level = 5  # Number of chunks to buffer before starting playback
@@ -818,42 +818,69 @@ class AudioTrack(MediaStreamTrack):
     async def recv(self):
         """Receive audio frame from queue and convert to WebRTC format"""
         try:
-            # 1. Handle Buffering State
-            if self._buffering:
-                if self.audio_queue.qsize() >= self._buffer_level:
-                    self._buffering = False
-                    logger.info("[PATH: AudioTrack.recv] Buffer filled, starting playback")
-                else:
+            # Main loop: prioritize draining buffer before fetching from queue
+            while True:
+                # 1. PRIORITY: Try to get frame from processor buffer first
+                # This ensures we drain all available audio before waiting for new data
+                frame = self.audio_processor.get_next_frame()
+                if frame is not None:
+                    # We have a ready frame - process and return it
+                    if frame.rate != self.sample_rate:
+                        logger.warning(f"[PATH: AudioTrack.recv] Frame rate mismatch: {frame.rate} != {self.sample_rate}, correcting")
+                        frame.rate = self.sample_rate
+                    
+                    # Set PTS - this must be continuous for smooth playback
+                    frame.pts = self.pts
+                    
+                    # Increment PTS by the number of samples in this frame
+                    self.pts += frame.samples
+                    
+                    logger.debug(f"[PATH: AudioTrack.recv] Returning frame: {frame.samples} samples, rate: {frame.rate}, buffer: {self.audio_processor.buffer_duration_ms:.1f}ms")
+                    return frame
+                
+                # 2. Buffer is empty - need to fetch from queue
+                # 3. Need more data - fetch from queue
+                try:
+                    # Use longer timeout when buffering, shorter when streaming
+                    # But also use longer timeout if buffer has data (might be end of turn with remaining audio)
+                    buffer_ms = self.audio_processor.buffer_duration_ms
+                    if buffer_ms > 0:
+                        # Buffer has some data but not enough for a frame - wait longer for more
+                        timeout = 0.5
+                    else:
+                        timeout = 0.5 if self._buffering else 0.1
+                    
+                    pcm_audio = await asyncio.wait_for(self.audio_queue.get(), timeout=timeout)
+                    logger.debug(f"[PATH: AudioTrack.recv] Received audio: {len(pcm_audio)} samples, queue size: {self.audio_queue.qsize()}")
+                except asyncio.TimeoutError:
+                    # Queue timeout - check if buffer still has data before returning silence
+                    buffer_ms = self.audio_processor.buffer_duration_ms
+                    if buffer_ms > 0:
+                        # Buffer still has data - continue loop to try extracting a frame
+                        # This handles the case where we have partial data that might form a frame
+                        logger.debug(f"[PATH: AudioTrack.recv] Queue timeout but buffer has {buffer_ms:.1f}ms, continuing to drain")
+                        continue
+                    
+                    # Both queue and buffer are empty
+                    if not self._buffering:
+                        logger.warning("[PATH: AudioTrack.recv] Buffer underrun, switching to buffering mode")
+                    self._buffering = True
                     return self._create_silence_frame()
+                
+                # 4. Add new data to processor buffer
+                self.audio_processor.add_audio(pcm_audio)
+                
+                # 5. Check if we should exit buffering mode (after adding data)
+                if self._buffering:
+                    buffer_ms = self.audio_processor.buffer_duration_ms
+                    queue_size = self.audio_queue.qsize()
+                    
+                    # Need at least 100ms (5 frames) buffered + some chunks in queue
+                    if buffer_ms >= 100 and queue_size >= 2:
+                        self._buffering = False
+                        logger.info(f"[PATH: AudioTrack.recv] Buffer filled ({buffer_ms:.1f}ms, {queue_size} chunks), starting playback")
             
-            # 2. Fetch Data
-            try:
-                # Keep the 0.5s timeout
-                pcm_audio = await asyncio.wait_for(self.audio_queue.get(), timeout=0.5)
-                logger.debug(f"[PATH: AudioTrack.recv] Received audio: {len(pcm_audio)} samples, queue size: {self.audio_queue.qsize()}")
-            except asyncio.TimeoutError:
-                # 3. Handle Underrun
-                logger.warning("[PATH: AudioTrack.recv] Buffer underrun, switching to buffering mode")
-                self._buffering = True
-                return self._create_silence_frame()
-            
-            # Resample to Opus/48kHz for WebRTC
-            frame = await self.audio_processor.process_outgoing_audio(pcm_audio)
-            
-            # CRITICAL: Ensure rate and PTS are set correctly
-            # The resampled frame should already have rate set, but verify
-            if frame.rate != self.sample_rate:
-                logger.warning(f"[PATH: AudioTrack.recv] Frame rate mismatch: {frame.rate} != {self.sample_rate}, correcting")
-                frame.rate = self.sample_rate
-            
-            # Set PTS - this must be continuous for smooth playback
-            frame.pts = self.pts
-            
-            # Increment PTS by the number of samples in this frame
-            # This ensures continuous timing
-            self.pts += frame.samples
-            
-            return frame
+                # Loop back to step 1 to try getting a frame from the updated buffer
         
         except Exception as e:
             logger.error(f"[PATH: AudioTrack.recv] Error: {e}", exc_info=True)
